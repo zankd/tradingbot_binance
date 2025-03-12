@@ -627,7 +627,6 @@ class BinanceTradingBot:
             # Calculate average entry price
             avg_entry = total_cost / total_amount if total_amount > 0 else 0
             
-            # Calculate current value of the entire position
             current_value = total_amount * float(current_price)
             
             self.logger.info(f"""
@@ -640,20 +639,14 @@ class BinanceTradingBot:
             Current Value: {current_value:.2f}
             """)
 
-            # Calculate raw profit (without fees)
             raw_profit = current_value - total_cost
             raw_profit_pct = (raw_profit / total_cost) * 100 if total_cost > 0 else 0
 
-            # Calculate estimated closing fee for selling the position
             closing_fee = self.calculate_fee(current_value)
             
-            # Calculate net profit (including both entry and exit fees)
             net_profit = raw_profit - total_fees - closing_fee
             net_profit_pct = (net_profit / total_cost) * 100 if total_cost > 0 else 0
 
-            # For display purposes, we'll use a more optimistic "current profit" that only includes
-            # a portion of the entry fee, proportional to how far the price has moved
-            # This prevents showing a large negative profit immediately after trade execution
             if raw_profit >= 0:
                 # If we're in profit, we can start accounting for the entry fee
                 fee_factor = min(1.0, raw_profit / total_fees) if total_fees > 0 else 1.0
