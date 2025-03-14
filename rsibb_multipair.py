@@ -627,6 +627,7 @@ class BinanceTradingBot:
             # Calculate average entry price
             avg_entry = total_cost / total_amount if total_amount > 0 else 0
             
+            # Calculate current value of the entire position
             current_value = total_amount * float(current_price)
             
             self.logger.info(f"""
@@ -639,14 +640,20 @@ class BinanceTradingBot:
             Current Value: {current_value:.2f}
             """)
 
+            # Calculate raw profit (without fees)
             raw_profit = current_value - total_cost
             raw_profit_pct = (raw_profit / total_cost) * 100 if total_cost > 0 else 0
 
+            # Calculate estimated closing fee for selling the position
             closing_fee = self.calculate_fee(current_value)
             
+            # Calculate net profit (including both entry and exit fees)
             net_profit = raw_profit - total_fees - closing_fee
             net_profit_pct = (net_profit / total_cost) * 100 if total_cost > 0 else 0
 
+            # For display purposes, we'll use a more optimistic "current profit" that only includes
+            # a portion of the entry fee, proportional to how far the price has moved
+            # This prevents showing a large negative profit immediately after trade execution
             if raw_profit >= 0:
                 # If we're in profit, we can start accounting for the entry fee
                 fee_factor = min(1.0, raw_profit / total_fees) if total_fees > 0 else 1.0
@@ -736,9 +743,9 @@ class BinanceTradingBot:
                 avg_entry_price = total_cost / total_amount if total_amount > 0 else 0
                 
                 # Display both base price and average entry price
-                print(f"    Entry: {Fore.CYAN}{base_price:.5f}{Style.RESET_ALL} | Avg: {Fore.CYAN}{avg_entry_price:.5f}{Style.RESET_ALL} | Current: {Fore.CYAN}{current_price:.5f}{Style.RESET_ALL}")
+                print(f"    Entry: {Fore.CYAN}{base_price:.5f}{Style.RESET_ALL} | Avg: {Fore.CYAN}{avg_entry_price:.5f}{Style.RESET_ALL}")
             else:
-                # Just display base price
+                # For positions without safety orders, show entry price and current price
                 print(f"    Entry: {Fore.CYAN}{base_price:.5f}{Style.RESET_ALL} | Current: {Fore.CYAN}{current_price:.5f}{Style.RESET_ALL}")
             
             print(f"    Total Amount:    {total_amount:.8f}")
@@ -1305,7 +1312,6 @@ class BinanceTradingBot:
             
             print(f"{symbol_color}{'~' * 60}{Style.RESET_ALL}")
             
-            # Position ID and safety orders on first line
             print(f"{symbol_color}Position {pos_id[:8]} - {safety_count} safety orders{Style.RESET_ALL}")
             
             base_price = float(position['base_price'])
@@ -1320,10 +1326,11 @@ class BinanceTradingBot:
                 
                 avg_entry_price = total_cost / total_amount if total_amount > 0 else 0
                 
-                # Display both base price and average entry price
-                print(f"  Entry: {Fore.CYAN}{base_price:.8f}{Style.RESET_ALL} | Avg: {Fore.CYAN}{avg_entry_price:.8f}{Style.RESET_ALL}")
+                print(f"  Entry: {Fore.CYAN}{base_price:.5f}{Style.RESET_ALL} | Avg: {Fore.CYAN}{avg_entry_price:.5f}{Style.RESET_ALL} | Current: {Fore.CYAN}{current_price:.5f}{Style.RESET_ALL}")
+            else:
+                # For positions without safety orders, show entry price and current price
+                print(f"  Entry: {Fore.CYAN}{base_price:.5f}{Style.RESET_ALL} | Current: {Fore.CYAN}{current_price:.5f}{Style.RESET_ALL}")
             
-            # Progress information
             print(f"  Profit: {color}{raw_profit_pct:+.2f}%{Style.RESET_ALL} (Target: {config.PROFIT_TARGET}%)")
             print(f"  Progress: {color}|{bar}| {progress:.1f}%{Style.RESET_ALL}")
 
@@ -1450,8 +1457,14 @@ class BinanceTradingBot:
                         continue
 
                 if self.check_entry_conditions(df.iloc[-1]):
-                    base_order_size = BASE_ORDER_SIZE
+                    base_order_size = BASE_ORDER_SIZE + self.base_order_increment
                     amount_to_buy = base_order_size / current_price
+                    
+                    # Log the base order size with reinvestment
+                    if self.base_order_increment > 0:
+                        self.logger.info(f"Creating base order with size {base_order_size:.2f} USDC (includes {self.base_order_increment:.2f} USDC reinvested profit)")
+                    else:
+                        self.logger.info(f"Creating base order with size {base_order_size:.2f} USDC")
                     
                     self.execute_trade(side='BUY', order_type='MARKET', amount=amount_to_buy, price=current_price)
 
@@ -1626,11 +1639,14 @@ def manage_combined_profit_distribution(bots):
     
     reinvest_threshold = 5.0  # USD
     savings_threshold = 3.0   # USD
+
+    last_action = 2 if total_savings > 0 and total_reinvested == 0 else \
+                  1 if total_reinvested > 0 and total_reinvested % reinvest_threshold == 0 else 0
     
     # Process profit distribution
     while available_profit >= min(reinvest_threshold, savings_threshold):
-        # First priority: reinvest in base order size
-        if available_profit >= reinvest_threshold:
+        if (last_action == 0 or last_action == 2) and available_profit >= reinvest_threshold:
+            # Reinvest in base order size
             reinvest_amount = reinvest_threshold
             available_profit -= reinvest_amount
             
@@ -1644,9 +1660,9 @@ def manage_combined_profit_distribution(bots):
                               f"(Total reinvested: {bot.profit_reinvested:.2f} USDC)")
             
             logger.info(f"Reinvested {reinvest_amount:.2f} USDC to base order size across all bots")
+            last_action = 1
             
-        # Second priority: save to wallet
-        elif available_profit >= savings_threshold:
+        elif last_action == 1 and available_profit >= savings_threshold:
             save_amount = savings_threshold
             available_profit -= save_amount
             
@@ -1659,6 +1675,9 @@ def manage_combined_profit_distribution(bots):
                               f"(Total saved: {bot.wallet_savings:.2f} USDC)")
             
             logger.info(f"Added {save_amount:.2f} USDC to wallet savings across all bots")
+            last_action = 2
+        else:
+            break
     
     return bots
 
@@ -1761,4 +1780,4 @@ def main():
 
 if __name__ == "__main__":
     ensure_directories()
-    main() 
+    main()
