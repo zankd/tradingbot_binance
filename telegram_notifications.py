@@ -86,7 +86,7 @@ class TelegramNotifier:
         fee_text = f"💸 Fee: {total_fees:.2f} USDC"
             
         message = f"""
-⚡ <b>INCOMING TRANSMISSION {exchange} New Trade Alert!</b> ⚡
+⚡ <b>INCOMING TRANSMISSION {exchange} Trade Alert!</b> ⚡
 
 📊 <b>{symbol}</b> - {side}
 ⚡ Type: {order_type}
@@ -338,4 +338,28 @@ receiving trading fee discounts.
 
 <i>Even robots need fuel, meatbag! Don't let me run on empty!</i> 🤖
 """
-        self.send_notification(message) 
+        self.send_notification(message)
+        
+    def notify_bnb_purchase(self, amount_usdc, amount_bnb, price, exchange=""):
+        message = f"""
+💰 <b>{exchange} BNB PURCHASE COMPLETED</b> 💰
+
+🔄 Purchased {amount_bnb:.6f} BNB for {amount_usdc:.2f} USDC
+💲 Price: {price:.2f} USDC per BNB
+⏱️ Time: {self.format_timestamp()}
+
+<i>Fuel tank refilled! Now I can keep those sweet fee discounts coming! 🤖⛽</i>
+"""
+        self.send_notification(message)
+        
+    def notify_bnb_purchase_failed(self, amount_usdc, error_message, exchange=""):
+        message = f"""
+❌ <b>{exchange} BNB PURCHASE FAILED</b> ❌
+
+💸 Attempted to purchase BNB for {amount_usdc:.2f} USDC
+⚠️ Error: {error_message}
+⏱️ Time: {self.format_timestamp()}
+
+<i>Well, that didn't work. Looks like I'll have to pay full price for fees like some kind of... human. 🤖💔</i>
+"""
+        self.send_notification(message)
