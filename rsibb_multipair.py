@@ -34,6 +34,7 @@ MAX_POSITION_SIZE = 800
 MAX_TOTAL_INVESTMENT = 3200
 INITIAL_BALANCE_PER_BOT = MAX_POSITION_SIZE
 CHECK_INTERVAL = 60  # seconds/candle
+AUTO_PURCHASE_BNB = True  # Enable automatic BNB purchases when balance is low
 
 class CustomAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
@@ -128,6 +129,7 @@ class BinanceTradingBot:
         self.using_bnb_for_fees = False
         self.maker_fee = MAKER_FEE_RATE
         self.taker_fee = TAKER_FEE_RATE
+        self.auto_purchase_bnb = AUTO_PURCHASE_BNB  # Add auto-purchase BNB setting
 
         self.exchange = ccxt.binance({
             'apiKey': config.TBAPI_KEY,
@@ -1401,10 +1403,101 @@ class BinanceTradingBot:
             # Update trading fees and check BNB balance
             self.update_trading_fees()
             
+            # Auto-purchase BNB if balance is low and auto-purchase is enabled
+            if hasattr(self, 'using_bnb_for_fees') and self.using_bnb_for_fees and hasattr(self, 'auto_purchase_bnb') and self.auto_purchase_bnb:
+                # Get current BNB balance
+                account_info = self.exchange.fetch_balance()
+                bnb_balance = 0
+                if 'BNB' in account_info:
+                    bnb_balance = float(account_info['BNB']['free']) if 'free' in account_info['BNB'] else 0
+                
+                # If BNB balance is below threshold, try to purchase more
+                if bnb_balance < 0.005:
+                    self.logger.info(f"BNB balance is low ({bnb_balance:.6f}). Attempting to purchase more.")
+                    self.auto_purchase_bnb()
+            
             self.logger.info(f"BNB balance check completed. Using BNB for fees: {self.using_bnb_for_fees}")
         except Exception as e:
             self.logger.error(f"Error checking BNB balance: {str(e)}")
+    
+    def auto_purchase_bnb(self):
+        """
+        Automatically purchase BNB to pay for trading fees when balance is low.
+        This function will use a small portion of wallet savings to buy BNB.
+        """
+        try:
+            # Constants for BNB purchase
+            BNB_PURCHASE_AMOUNT_USDC = 10.0  # Amount in USDC to spend on BNB
+            MIN_WALLET_SAVINGS = 5.0  # Minimum wallet savings required to purchase BNB
             
+            # Check if we have enough wallet savings to purchase BNB
+            if self.wallet_savings < MIN_WALLET_SAVINGS:
+                self.logger.warning(f"Not enough wallet savings ({self.wallet_savings:.2f} USDC) to purchase BNB. Minimum required: {MIN_WALLET_SAVINGS:.2f} USDC")
+                return False
+            
+            # Calculate amount to spend (limited by wallet savings)
+            purchase_amount = min(BNB_PURCHASE_AMOUNT_USDC, self.wallet_savings - 1.0)  # Keep at least 1 USDC in savings
+            
+            # Get current BNB/USDC price
+            try:
+                ticker = self.exchange.fetch_ticker('BNB/USDC')
+                bnb_price = ticker['last']
+                
+                # Calculate BNB amount to buy
+                bnb_amount = purchase_amount / bnb_price
+                
+                # Log the purchase attempt
+                self.logger.info(f"Attempting to purchase {bnb_amount:.6f} BNB for {purchase_amount:.2f} USDC at price {bnb_price:.2f}")
+                
+                # Execute the purchase
+                order = self.exchange.create_order(
+                    symbol='BNB/USDC',
+                    type='market',
+                    side='buy',
+                    amount=bnb_amount
+                )
+                
+                # Get executed price and amount
+                executed_price = float(order['price']) if 'price' in order and order['price'] else bnb_price
+                executed_amount = float(order['amount']) if 'amount' in order and order['amount'] else bnb_amount
+                actual_cost = executed_price * executed_amount
+                
+                # Update wallet savings
+                self.wallet_savings -= actual_cost
+                
+                # Log the successful purchase
+                self.logger.info(f"Successfully purchased {executed_amount:.6f} BNB for {actual_cost:.2f} USDC")
+                self.logger.info(f"Wallet savings updated: {self.wallet_savings:.2f} USDC")
+                
+                # Send Telegram notification
+                if hasattr(self, 'telegram') and self.telegram is not None:
+                    self.telegram.notify_bnb_purchase(
+                        amount_usdc=actual_cost,
+                        amount_bnb=executed_amount,
+                        price=executed_price,
+                        exchange="Binance"
+                    )
+                
+                return True
+                
+            except Exception as e:
+                error_message = str(e)
+                self.logger.error(f"Error purchasing BNB: {error_message}")
+                
+                # Send Telegram notification about the failure
+                if hasattr(self, 'telegram') and self.telegram is not None:
+                    self.telegram.notify_bnb_purchase_failed(
+                        amount_usdc=purchase_amount,
+                        error_message=error_message,
+                        exchange="Binance"
+                    )
+                
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error in auto_purchase_bnb: {str(e)}")
+            return False
+
     def run_trading_loop(self):
         """Main trading loop"""
         self.logger.info(f"Starting trading loop for {self.symbol}")
