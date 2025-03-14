@@ -17,7 +17,6 @@ class TelegramNotifier:
         fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
         self.logger.addHandler(fh)
         
-        # Track connection status
         self.last_connection_error = None
         self.connection_retry_count = 0
         self.max_retries = 3
@@ -26,7 +25,6 @@ class TelegramNotifier:
     def format_timestamp(self, for_storage=False):
         """Return a consistently formatted timestamp string"""
         now = datetime.now()
-        # Always format with precision only up to seconds
         return now.strftime('%Y-%m-%d %H:%M:%S')
 
     def send_notification(self, message):
@@ -40,7 +38,6 @@ class TelegramNotifier:
             response = requests.post(self.base_url, json=payload, timeout=10)
             if response.status_code == 200:
                 self.logger.info(f"Message sent successfully: {message}")
-                # Reset connection error tracking on success
                 self.last_connection_error = None
                 self.connection_retry_count = 0
                 return True
@@ -167,7 +164,6 @@ class TelegramNotifier:
             f"💥 Error: {last_error if last_error else 'Unknown connection issue'}\n\n"
             f"<i>I'm trying to reach the mothership but the signal is weak! 📡</i>"
         )
-        # Try to send, but don't retry if it fails (to avoid infinite loops)
         try:
             requests.post(self.base_url, json={
                 'chat_id': self.chat_id,
