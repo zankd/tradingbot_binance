@@ -17,12 +17,12 @@ init()
 
 RSI_PERIOD = 14
 BB_PERIOD = 20
-BB_STD = 2
-RSI_BUY_THRESHOLD = 30
+BB_STD = 2.2
+RSI_BUY_THRESHOLD = 32 
 BASE_ORDER_SIZE = 20
 MAX_ACTIVE_ORDERS = 2
 MAX_SAFETY_ORDERS = 10
-SAFETY_ORDER_STEP = 1.0  # %
+SAFETY_ORDER_STEP = 1.2 # %
 TRADING_FEE = 0.1  # USDC - Default fee as fallback
 BNB_DISCOUNT_ENABLED = True
 MAKER_FEE_RATE = 0.1  # 0.1% maker fee
@@ -30,8 +30,8 @@ TAKER_FEE_RATE = 0.095  # 0.1% taker fee
 BNB_DISCOUNT_RATE = 0.75  # 25% discount using BNB
 SAFETY_ORDER_VOLUME_SCALE = 1.05
 WAIT_TIME_AFTER_CLOSE = 40  # seconds
-MAX_POSITION_SIZE = 800
-MAX_TOTAL_INVESTMENT = 3200
+MAX_POSITION_SIZE = 220
+MAX_TOTAL_INVESTMENT = 220
 INITIAL_BALANCE_PER_BOT = MAX_POSITION_SIZE
 CHECK_INTERVAL = 60  # seconds/candle
 AUTO_PURCHASE_BNB = True  # Enable automatic BNB purchases when balance is low
@@ -86,11 +86,14 @@ DEFAULT_SYMBOL_COLOR = Fore.CYAN
 
 
 class SharedBalance:
-    def __init__(self, total_balance):
-        self.total_balance = total_balance
-        self.available_balance = total_balance
+    def __init__(self, initial_total_balance, exchange, quote_currency='USDC'):
+        self.total_balance = initial_total_balance
+        self.available_balance = initial_total_balance
         self.allocated_funds = {}
         self.lock = threading.Lock()
+        self.exchange = exchange  # Store the shared exchange instance
+        self.quote_currency = quote_currency
+        self.last_update_time = datetime.now()
 
     def allocate(self, symbol, amount):
         with self.lock:
@@ -115,8 +118,179 @@ class SharedBalance:
     def get_symbol_allocation(self, symbol):
         return self.allocated_funds.get(symbol, 0)
 
+    def update_balance_from_exchange(self):
+        """Fetches the current total balance for the quote currency from the exchange."""
+        try:
+            balance_info = self.exchange.fetch_balance()
+            # Find the free balance for the quote currency (e.g., USDC)
+            new_total_balance = balance_info['free'][self.quote_currency]
+            with self.lock:
+                # Calculate the difference from the last known total
+                diff = new_total_balance - self.total_balance
+                # Adjust available balance by the same difference
+                self.available_balance += diff
+                # Update the total balance
+                self.total_balance = new_total_balance
+                self.last_update_time = datetime.now()
+                logger.info(f"SharedBalance updated: Total {self.quote_currency}: {self.total_balance:.2f}, Available: {self.available_balance:.2f}")
+                return True
+        except (ccxt.NetworkError, ccxt.ExchangeError, KeyError, Exception) as e:
+            logger.error(f"Error updating shared balance from exchange: {e}")
+            return False
+
+
+# Clase para monitorear el rendimiento por par de trading
+class TradingPerformanceMonitor:
+    def __init__(self, symbol):
+        self.symbol = symbol
+        self.trades_history = []
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0
+        self.total_loss = 0
+        self.max_drawdown = 0
+        self.best_trade_profit = 0
+        self.worst_trade_loss = 0
+        self.avg_profit_per_trade = 0
+        self.avg_holding_time = timedelta(0)
+        self.last_analysis_time = datetime.now()
+        
+        # Crear archivo CSV para estadísticas de rendimiento
+        self.performance_file = os.path.join(
+            'logs', 'performance', f"performance_{symbol.lower().replace('/', '_')}.csv")
+        self.ensure_performance_file()
+    
+    def ensure_performance_file(self):
+        # Asegurarse de que el directorio existe
+        os.makedirs(os.path.dirname(self.performance_file), exist_ok=True)
+        
+        # Crear el archivo si no existe
+        if not os.path.exists(self.performance_file):
+            with open(self.performance_file, mode='w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([
+                    'Timestamp', 'Symbol', 'Total Trades', 'Win Rate', 
+                    'Total Profit', 'Avg Profit/Trade', 'Max Drawdown',
+                    'Best Trade', 'Worst Trade', 'Avg Holding Time'
+                ])
+    
+    def add_trade(self, trade_data):
+        self.trades_history.append(trade_data)
+        self.total_trades += 1
+        
+        profit = trade_data.get('profit', 0)
+        if profit > 0:
+            self.winning_trades += 1
+            self.total_profit += profit
+            if profit > self.best_trade_profit:
+                self.best_trade_profit = profit
+        else:
+            self.losing_trades += 1
+            self.total_loss += abs(profit)
+            if abs(profit) > abs(self.worst_trade_loss):
+                self.worst_trade_loss = profit
+        
+        # Actualizar estadísticas
+        self.update_statistics()
+    
+    def update_statistics(self):
+        if self.total_trades > 0:
+            # Calcular win rate
+            self.win_rate = (self.winning_trades / self.total_trades) * 100
+            
+            # Calcular promedio de ganancia por operación
+            total_pnl = self.total_profit - self.total_loss
+            self.avg_profit_per_trade = total_pnl / self.total_trades
+            
+            # Calcular tiempo promedio de retención
+            if self.trades_history:
+                total_holding_time = timedelta(0)
+                valid_trades = 0
+                for trade in self.trades_history:
+                    if 'holding_time' in trade:
+                        try:
+                            # Convertir string a timedelta si es necesario
+                            if isinstance(trade['holding_time'], str):
+                                parts = trade['holding_time'].split(':')
+                                if len(parts) == 3:
+                                    hours, minutes, seconds = map(int, parts)
+                                    td = timedelta(hours=hours, minutes=minutes, seconds=seconds)
+                                    total_holding_time += td
+                                    valid_trades += 1
+                            elif isinstance(trade['holding_time'], timedelta):
+                                total_holding_time += trade['holding_time']
+                                valid_trades += 1
+                        except Exception:
+                            pass
+                
+                if valid_trades > 0:
+                    self.avg_holding_time = total_holding_time / valid_trades
+    
+    def calculate_drawdown(self, current_positions, current_price):
+        # Calcular drawdown actual basado en posiciones abiertas
+        max_drawdown = 0
+        for pos_id, position in current_positions.items():
+            if position.get('status') == 'CLOSED':
+                continue
+                
+            # Calcular valor actual
+            total_amount = position.get('base_amount', 0)
+            for order in position.get('safety_orders', []):
+                total_amount += order.get('amount', 0)
+            
+            current_value = total_amount * current_price
+            
+            # Calcular costo total
+            total_cost = position.get('total_cost', 0) + position.get('total_fees', 0)
+            
+            # Calcular drawdown en porcentaje
+            if total_cost > 0:
+                drawdown_pct = ((current_value - total_cost) / total_cost) * 100
+                if drawdown_pct < 0 and abs(drawdown_pct) > abs(max_drawdown):
+                    max_drawdown = drawdown_pct
+        
+        # Actualizar max drawdown si es necesario
+        if abs(max_drawdown) > abs(self.max_drawdown):
+            self.max_drawdown = max_drawdown
+            
+        return max_drawdown
+    
+    def save_performance_data(self):
+        # Guardar datos de rendimiento en CSV
+        with open(self.performance_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                self.symbol,
+                self.total_trades,
+                f"{self.win_rate:.2f}%" if hasattr(self, 'win_rate') else "0.00%",
+                f"{(self.total_profit - self.total_loss):.2f}",
+                f"{self.avg_profit_per_trade:.2f}" if hasattr(self, 'avg_profit_per_trade') else "0.00",
+                f"{self.max_drawdown:.2f}%",
+                f"{self.best_trade_profit:.2f}",
+                f"{self.worst_trade_loss:.2f}",
+                str(self.avg_holding_time).split('.')[0]  # Eliminar microsegundos
+            ])
+    
+    def generate_performance_report(self):
+        # Generar informe de rendimiento
+        report = f"""
+        ===== INFORME DE RENDIMIENTO PARA {self.symbol} =====
+        Operaciones totales: {self.total_trades}
+        Tasa de éxito: {self.win_rate:.2f}% ({self.winning_trades} ganadas, {self.losing_trades} perdidas)
+        Beneficio total: {(self.total_profit - self.total_loss):.2f} USDC
+        Beneficio promedio por operación: {self.avg_profit_per_trade:.2f} USDC
+        Máximo drawdown: {self.max_drawdown:.2f}%
+        Mejor operación: {self.best_trade_profit:.2f} USDC
+        Peor operación: {self.worst_trade_loss:.2f} USDC
+        Tiempo promedio de retención: {str(self.avg_holding_time).split('.')[0]}
+        """
+        return report
+
 
 class BinanceTradingBot:
+    # Removed exchange instance creation from bot, will use shared_balance.exchange
     def __init__(self, symbol, shared_balance, initial_allocation):
         self.symbol = symbol
         self.shared_balance = shared_balance
@@ -144,11 +318,8 @@ class BinanceTradingBot:
         self.taker_fee = TAKER_FEE_RATE
         self.auto_purchase_bnb = AUTO_PURCHASE_BNB  # Add auto-purchase BNB setting
 
-        self.exchange = ccxt.binance({
-            'apiKey': config.TBAPI_KEY,
-            'secret': config.TBAPI_SECRET,
-        })
-        self.exchange.set_sandbox_mode(True)
+        # Use the shared exchange instance from SharedBalance
+        self.exchange = shared_balance.exchange
 
         self.csv_file = os.path.join(
             'logs', 'trades', f"trades_{symbol.lower().replace('/', '_')}.csv")
@@ -179,6 +350,9 @@ class BinanceTradingBot:
         self.candle_history = pd.DataFrame()
         self.min_required_candles = max(RSI_PERIOD, BB_PERIOD) + 10
 
+        # Inicializar el monitor de rendimiento para este par
+        self.performance_monitor = TradingPerformanceMonitor(symbol)
+        
         self.recovery = TradingRecovery(symbol)
 
         if self.recovery.restore_from_backup(self):
@@ -386,35 +560,42 @@ class BinanceTradingBot:
         return self.base_order_increment
 
     def check_funds_available(self, required_amount):
+        # Check if there's enough *available* balance for this specific order
         if self.shared_balance.available_balance < required_amount:
             self.logger.info(f"""
-            Insufficient shared balance:
+            Insufficient shared *available* balance:
             Required: {required_amount:.2f} USDC
             Available: {self.shared_balance.available_balance:.2f} USDC
             """)
             return False
 
-        symbol_allocation = self.shared_balance.get_symbol_allocation(
-            self.symbol)
+        # Check if adding this amount exceeds the per-symbol limit
+        symbol_allocation = self.shared_balance.get_symbol_allocation(self.symbol)
         if symbol_allocation + required_amount > MAX_POSITION_SIZE:
             self.logger.info(f"""
             Symbol allocation limit reached:
-            Current: {symbol_allocation:.2f} USDC
-            Required: {required_amount:.2f} USDC
-            Max: {MAX_POSITION_SIZE} USDC
+            Current Allocation: {symbol_allocation:.2f} USDC
+            Required Additional: {required_amount:.2f} USDC
+            Max Per Symbol: {MAX_POSITION_SIZE} USDC
             """)
             return False
 
-        total_allocated = sum(self.shared_balance.allocated_funds.values())
-        if total_allocated + required_amount > MAX_TOTAL_INVESTMENT:
+        # Check if this allocation would push the *estimated* total balance over the limit
+        # This acts as a final safeguard
+        potential_total = self.shared_balance.total_balance + required_amount
+        if potential_total > MAX_TOTAL_INVESTMENT:
             self.logger.info(f"""
-            Total investment limit reached:
-            Current: {total_allocated:.2f} USDC
-            Required: {required_amount:.2f} USDC
-            Max: {MAX_TOTAL_INVESTMENT} USDC
+            Allocation would exceed total investment limit:
+            Current Total Balance: {self.shared_balance.total_balance:.2f} USDC
+            Required Additional: {required_amount:.2f} USDC
+            Potential Total: {potential_total:.2f} USDC
+            Max Total Investment: {MAX_TOTAL_INVESTMENT} USDC
             """)
+            # Consider if you want to allow partial allocation up to the limit
+            # For now, denying the full amount is safer.
             return False
 
+        # If all checks pass
         return True
 
     def calculate_fee(self, cost):
@@ -483,12 +664,119 @@ class BinanceTradingBot:
 
             # Execute the order
             order = self.exchange.create_order(**order_params)
-
-            # Extract order details
             order_id = order['id']
-            executed_price = float(order['price'])
-            executed_amount = float(order['amount'])
+            self.logger.info(f"Order {order_id} created for {self.symbol} with params: {order_params}")
+
+            # For BUY limit orders, check if filled within timeout
+            if side.lower() == 'buy' and order_params.get('type') == 'limit':
+                order_filled = False
+                order_details_fetched = False # To track if we got order details from fetch_order
+                start_time_check = time.time()
+                timeout_seconds = 120  # 2 minutes timeout
+                self.logger.info(f"BUY Limit order {order_id} for {self.symbol}. Waiting for fill (timeout: {timeout_seconds}s).")
+                
+                while time.time() - start_time_check < timeout_seconds:
+                    try:
+                        fetched_order = self.exchange.fetch_order(order_id, self.exchange_symbol)
+                        order_details_fetched = True
+                        if fetched_order['status'] == 'closed':  # 'closed' means filled for limit orders
+                            order_filled = True
+                            order = fetched_order  # Update order with filled details (price, amount, fees)
+                            self.logger.info(f"BUY Limit order {order_id} for {self.symbol} FILLED. Price: {order.get('average', order.get('price'))}, Amount: {order.get('filled')}")
+                            break
+                        elif fetched_order['status'] == 'canceled':
+                            self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} was CANCELED externally before filling.")
+                            self.telegram.send_notification(f"⚠️ {self.symbol} BUY Limit order {order_id[:8]} CANCELED externally.")
+                            return None  # Order canceled, do not proceed
+                        elif fetched_order['status'] == 'expired':
+                            self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} EXPIRED.")
+                            self.telegram.send_notification(f"⚠️ {self.symbol} BUY Limit order {order_id[:8]} EXPIRED.")
+                            return None # Order expired
+                        
+                        self.logger.debug(f"BUY Limit order {order_id} status: {fetched_order['status']}. Waiting... ({int(time.time() - start_time_check)}s / {timeout_seconds}s)")
+                        time.sleep(10)  # Check every 10 seconds
+                    except ccxt.OrderNotFound:
+                        self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} not found during status check. It might have filled and been removed or an issue occurred.")
+                        # Attempt to fetch trades for the symbol to see if it filled
+                        try:
+                            trades = self.exchange.fetch_my_trades(symbol=self.exchange_symbol, limit=5)
+                            for trade_item in trades: # renamed trade to trade_item to avoid conflict with outer scope if any
+                                if trade_item['order'] == order_id:
+                                    self.logger.info(f"BUY Limit order {order_id} found in recent trades. Assuming filled and attempting to re-fetch order details.")
+                                    try:
+                                        order = self.exchange.fetch_order(order_id, self.exchange_symbol) # Re-assign to 'order'
+                                        if order['status'] == 'closed':
+                                            order_filled = True
+                                            order_details_fetched = True
+                                            self.logger.info(f"Re-fetched BUY Limit order {order_id} for {self.symbol} - FILLED.")
+                                        break # Exit trades loop
+                                    except Exception as e_refetch:
+                                        self.logger.error(f"Could not re-fetch order {order_id} after OrderNotFound but found in trades: {e_refetch}")
+                            if order_filled: break # Exit while loop
+                        except Exception as e_trades:
+                            self.logger.error(f"Error fetching trades for {order_id}: {e_trades}")
+                        time.sleep(10) # Wait before retrying fetch_order in the main loop
+                    except Exception as e:
+                        self.logger.error(f"Error fetching order {order_id} status: {e}. Retrying in 10s.")
+                        time.sleep(10)
+                        continue  # Retry fetching status
+                
+                if not order_filled:
+                    self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} did not fill within {timeout_seconds}s.")
+                    try:
+                        cancel_attempt = self.exchange.cancel_order(order_id, self.exchange_symbol)
+                        self.logger.info(f"Attempted to cancel BUY Limit order {order_id}. Response: {cancel_attempt}")
+                        time.sleep(2) # Give time for cancellation to process
+                        final_check_order = self.exchange.fetch_order(order_id, self.exchange_symbol)
+                        order_details_fetched = True
+                        if final_check_order['status'] == 'canceled':
+                            self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} successfully CANCELED after timeout.")
+                            self.telegram.send_notification(f"⚠️ {self.symbol} BUY Limit order {order_id[:8]} timed out and was CANCELED.")
+                        elif final_check_order['status'] == 'closed':
+                             self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} was FILLED just before/during cancellation.")
+                             order = final_check_order # Update order with filled details
+                             order_filled = True # Treat as filled
+                        else:
+                            self.logger.error(f"BUY Limit order {order_id} for {self.symbol} timed out but FAILED to cancel or status unclear: {final_check_order['status']}. Manual check required.")
+                            self.telegram.send_notification(f"🚨 CRITICAL: {self.symbol} BUY Limit order {order_id[:8]} timed out, FAILED to cancel. Status: {final_check_order['status']}. Manual check!")
+                    except ccxt.OrderNotFound:
+                         self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} not found during cancellation. Assumed already canceled/expired or filled and removed.")
+                         # If not found, it's likely not open. To be safe, don't assume filled unless confirmed.
+                    except Exception as e:
+                        self.logger.error(f"Error canceling timed out BUY limit order {order_id}: {e}. Order might still be active or filled.")
+                        self.telegram.send_notification(f"🚨 ERROR: {self.symbol} BUY Limit order {order_id[:8]} timed out. Error during cancellation: {e}. Manual check!")
+                    
+                    if not order_filled: # If still not marked as filled after cancellation logic
+                        return None  # Order not filled and (attempted) canceled, do not proceed
+
+            # If the order was not a BUY LIMIT, or it was filled, or it was a market order.
+            # For market orders or if fetch_order wasn't called successfully during limit order check, fetch details.
+            if not order_details_fetched or (order_params.get('type') == 'market' and not order.get('filled')):
+                try:
+                    time.sleep(1) # Give a moment for market order to fill / details to be available
+                    fetched_order = self.exchange.fetch_order(order_id, self.exchange_symbol)
+                    order = fetched_order # Update order with latest details
+                    self.logger.info(f"Fetched/updated details for order {order_id}: Status {order.get('status')}, Filled: {order.get('filled')}, Price: {order.get('average', order.get('price'))}")
+                except Exception as e:
+                    self.logger.error(f"Could not fetch/update details for order {order_id}: {e}")
+                    if side.lower() == 'buy':
+                        self.telegram.send_notification(f"🚨 WARNING: {self.symbol} BUY order {order_id[:8]} - could not confirm fill details. {e}")
+                        # Depending on strictness, might return None here
+
+            executed_price = float(order.get('average', order.get('price', 0)))
+            executed_amount = float(order.get('filled', order.get('amount', 0)))
+            
+            if side.lower() == 'buy' and executed_amount == 0:
+                current_status = order.get('status', 'unknown')
+                self.logger.error(f"BUY order {order_id} for {self.symbol} resulted in 0 filled amount. Final Status: {current_status}.")
+                if current_status not in ['canceled', 'expired']:
+                    self.telegram.send_notification(f"🚨 CRITICAL: {self.symbol} BUY order {order_id[:8]} reported 0 filled amount. Status: {current_status}. Manual check needed!")
+                return None
+
             actual_cost = executed_price * executed_amount
+            if side.lower() == 'buy' and actual_cost == 0 and executed_amount > 0:
+                 self.logger.warning(f"BUY order {order_id} for {self.symbol} has 0 cost (price: {executed_price}) but filled amount {executed_amount}. This might be a data issue or an exchange peculiarity.")
+
 
             # Calculate fee based on the actual cost
             actual_fee = self.calculate_fee(actual_cost)
@@ -991,6 +1279,10 @@ class BinanceTradingBot:
 
             # Update balance with net proceeds
             self.balance += net_proceeds
+            
+            # Log the profit being added to realized profit for debugging
+            self.logger.info(f"Received profit: {profit:.2f} USDC (Total realized: {self.realized_profit + profit:.2f} USDC)")
+            
             self.realized_profit += profit
             self.total_fees_paid += closing_fee
 
@@ -1041,9 +1333,37 @@ class BinanceTradingBot:
             self.logger.info(
                 f"Position {position_id} removed from active positions")
 
-            # Manage profit distribution (just add to realized profit)
+            # Registrar datos de la operación en el monitor de rendimiento
+            trade_data = {
+                'position_id': position_id,
+                'symbol': self.symbol,
+                'entry_price': position['base_price'],
+                'exit_price': executed_price,
+                'profit': profit,
+                'profit_percentage': profit_percentage,
+                'fees': total_fees + closing_fee,
+                'holding_time': time_held,
+                'timestamp': formatted_timestamp,
+                'safety_orders_used': len(position['safety_orders'])
+            }
+            self.performance_monitor.add_trade(trade_data)
+            
+            # Guardar datos de rendimiento cada 5 operaciones o cada 24 horas
+            if (self.performance_monitor.total_trades % 5 == 0 or 
+                (datetime.now() - self.performance_monitor.last_analysis_time).total_seconds() > 86400):
+                self.performance_monitor.save_performance_data()
+                performance_report = self.performance_monitor.generate_performance_report()
+                self.logger.info(f"Informe de rendimiento para {self.symbol}:\n{performance_report}")
+                self.performance_monitor.last_analysis_time = datetime.now()
+                
+                # Enviar informe de rendimiento por Telegram
+                # Changed from notify_custom_message to send_notification as the former doesn't exist
+                self.telegram.send_notification(
+                    f"📊 Informe de rendimiento para {self.symbol}:\n{performance_report}")
+
+            # Manage profit distribution (profit is already added to self.realized_profit)
             if profit > 0:
-                self.manage_profit_distribution(profit)
+                # self.manage_profit_distribution(profit) # This was causing double profit reporting
 
                 # Update win/loss counters
                 self.winning_trades += 1
@@ -1425,8 +1745,8 @@ class BinanceTradingBot:
                         bb_color = Fore.GREEN if bb_below else Fore.RED if price_bb_ratio > 1.05 else Fore.YELLOW
 
                         print(
-                            f"  Entry conditions: RSI [{rsi_color}{'✓' if rsi_below else '✗'}{Style.RESET_ALL}] " +
-                            f"BB [{bb_color}{'✓' if bb_below else '✗'}{Style.RESET_ALL}]")
+                            f"  Entry conditions: RSI [{rsi_color}{'SI' if rsi_below else 'NO'}{Style.RESET_ALL}] " +
+                            f"BB [{bb_color}{'SI' if bb_below else 'NO'}{Style.RESET_ALL}]")
                     else:
                         print(
                             f"\n{Fore.YELLOW}Waiting for valid indicators...{Style.RESET_ALL}")
@@ -1767,6 +2087,21 @@ class BinanceTradingBot:
 
                 self.check_safety_orders(current_price, current_time)
 
+                # Calcular drawdown actual y actualizar monitor de rendimiento
+                current_drawdown = self.performance_monitor.calculate_drawdown(self.positions, current_price)
+                if current_drawdown < 0:
+                    self.logger.info(f"Drawdown actual para {self.symbol}: {current_drawdown:.2f}%")
+                
+                # Actualizar datos de rendimiento cada hora
+                if (current_time - self.performance_monitor.last_analysis_time).total_seconds() >= 3600:
+                    self.performance_monitor.save_performance_data()
+                    self.performance_monitor.last_analysis_time = current_time
+                    
+                    # Generar informe de rendimiento periódico si hay suficientes operaciones
+                    if self.performance_monitor.total_trades > 0:
+                        performance_report = self.performance_monitor.generate_performance_report()
+                        self.logger.info(f"Informe de rendimiento periódico para {self.symbol}:\n{performance_report}")
+
                 self.update_unrealized_profits(current_price)
 
                 self.print_quick_status(current_price, current_time)
@@ -1937,12 +2272,98 @@ def ensure_directories():
         'logs',
         'logs/backups',
         'logs/trades',
+        'logs/performance',  # Directorio para archivos de rendimiento por par
         'backups/states',
         'backups/trades'
     ]
     for directory in directories:
         os.makedirs(directory, exist_ok=True)
 
+
+def compare_trading_pairs_performance(bots):
+    """Compara el rendimiento entre diferentes pares de trading y genera un informe"""
+    performance_data = []
+    
+    for symbol, bot in bots.items():
+        if hasattr(bot, 'performance_monitor'):
+            perf = bot.performance_monitor
+            win_rate = perf.win_rate if hasattr(perf, 'win_rate') else 0
+            total_profit = perf.total_profit - perf.total_loss
+            avg_profit = perf.avg_profit_per_trade if hasattr(perf, 'avg_profit_per_trade') else 0
+            
+            performance_data.append({
+                'symbol': symbol,
+                'total_trades': perf.total_trades,
+                'win_rate': win_rate,
+                'total_profit': total_profit,
+                'avg_profit': avg_profit,
+                'max_drawdown': perf.max_drawdown
+            })
+    
+    # Ordenar por rentabilidad total
+    performance_data.sort(key=lambda x: x['total_profit'], reverse=True)
+    
+    # Generar informe
+    report = "\n===== COMPARACIÓN DE RENDIMIENTO ENTRE PARES =====\n"
+    report += "Ordenado por beneficio total:\n\n"
+    
+    for idx, data in enumerate(performance_data, 1):
+        report += f"{idx}. {data['symbol']}:\n"
+        report += f"   Operaciones: {data['total_trades']}\n"
+        report += f"   Tasa de éxito: {data['win_rate']:.2f}%\n"
+        report += f"   Beneficio total: {data['total_profit']:.2f} USDC\n"
+        report += f"   Beneficio promedio: {data['avg_profit']:.2f} USDC/operación\n"
+        report += f"   Máximo drawdown: {data['max_drawdown']:.2f}%\n\n"
+    
+    # Registrar en el log
+    logger = logging.getLogger("performance_comparison")
+    logger.info(report)
+    
+    # Guardar en archivo CSV
+    csv_file = os.path.join('logs', 'performance', f"pairs_comparison_{datetime.now().strftime('%Y%m%d')}.csv")
+    with open(csv_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Symbol', 'Total Trades', 'Win Rate', 'Total Profit', 'Avg Profit/Trade', 'Max Drawdown'])
+        for data in performance_data:
+            writer.writerow([
+                data['symbol'],
+                data['total_trades'],
+                f"{data['win_rate']:.2f}%",
+                f"{data['total_profit']:.2f}",
+                f"{data['avg_profit']:.2f}",
+                f"{data['max_drawdown']:.2f}%"
+            ])
+    
+    # Enviar informe de comparación por Telegram
+    try:
+        # Usar el primer bot disponible para enviar la notificación
+        if bots and len(bots) > 0:
+            first_bot = next(iter(bots.values()))
+            if hasattr(first_bot, 'telegram') and first_bot.telegram is not None:
+                # Crear mensaje para Telegram
+                telegram_msg = "📊 COMPARACIÓN DE RENDIMIENTO ENTRE PARES\n\n"
+                
+                # Añadir emojis para clasificar el rendimiento
+                for idx, data in enumerate(performance_data, 1):
+                    # Determinar emoji basado en rentabilidad
+                    if data['total_profit'] > 0:
+                        emoji = "🟢" if data['win_rate'] > 50 else "🟡"
+                    else:
+                        emoji = "🔴"
+                        
+                    telegram_msg += f"{emoji} {idx}. {data['symbol']}:\n"
+                    telegram_msg += f"   Operaciones: {data['total_trades']}\n"
+                    telegram_msg += f"   Tasa de éxito: {data['win_rate']:.2f}%\n"
+                    telegram_msg += f"   Beneficio: {data['total_profit']:.2f} USDC\n"
+                    telegram_msg += f"   Drawdown máx: {data['max_drawdown']:.2f}%\n\n"
+                
+                # Enviar mensaje
+                first_bot.telegram.notify_custom_message(telegram_msg)
+                logger.info("Informe de comparación enviado por Telegram")
+    except Exception as e:
+        logger.error(f"Error al enviar informe de comparación por Telegram: {str(e)}")
+    
+    return report
 
 def manage_combined_profit_distribution(bots):
     total_realized = 0
@@ -1953,6 +2374,13 @@ def manage_combined_profit_distribution(bots):
         total_realized += bot.realized_profit
         total_reinvested += bot.profit_reinvested
         total_savings += bot.wallet_savings
+    
+    # Generar informe de comparación de rendimiento cada 24 horas
+    current_time = datetime.now()
+    last_comparison_time = getattr(manage_combined_profit_distribution, 'last_comparison_time', None)
+    if last_comparison_time is None or (current_time - last_comparison_time).total_seconds() > 86400:
+        compare_trading_pairs_performance(bots)
+        manage_combined_profit_distribution.last_comparison_time = current_time
 
     available_profit = total_realized - total_reinvested - total_savings
 
@@ -2042,8 +2470,22 @@ def manage_combined_profit_distribution(bots):
 
 def main():
     symbols = ["BTC/USDC", "XRP/USDC", "HBAR/USDC", "SOL/USDC"]
+    quote_currency = 'USDC' # Define the quote currency
 
-    shared_balance = SharedBalance(MAX_TOTAL_INVESTMENT)
+    # Create a single shared exchange instance
+    try:
+        exchange = ccxt.binance({
+            'apiKey': config.TAPI_KEY,
+            'secret': config.TAPI_SECRET,
+        })
+        exchange.set_sandbox_mode(True) # Set sandbox mode if needed
+        logger.info("Shared Binance exchange instance created.")
+    except Exception as e:
+        logger.error(f"Failed to create shared Binance exchange instance: {e}")
+        print(f"{Fore.RED}Fatal Error: Could not connect to Binance. Exiting.{Style.RESET_ALL}")
+        return # Exit if connection fails
+
+    shared_balance = SharedBalance(MAX_TOTAL_INVESTMENT, exchange, quote_currency)
 
     bots = {}
     threads = []
@@ -2083,10 +2525,18 @@ def main():
 
     last_combined_summary_time = datetime.now()
     last_profit_distribution_time = datetime.now()
+    last_balance_update_time = datetime.now() # Track balance update time
 
     try:
         while True:
             current_time = datetime.now()
+
+            # Check for profit distribution every 5 minutes
+            # Update shared balance periodically (e.g., every 5 minutes)
+            if (current_time - last_balance_update_time).total_seconds() >= 300:
+                logger.info("Attempting to update shared balance from exchange...")
+                shared_balance.update_balance_from_exchange()
+                last_balance_update_time = current_time
 
             # Check for profit distribution every 5 minutes
             if (current_time - last_profit_distribution_time).total_seconds() >= 300:
@@ -2115,6 +2565,10 @@ def main():
                         'win_rate': win_rate
                     }
 
+                    # Log individual bot's realized profit for debugging
+                    logger.info(f"Adding {symbol} realized profit: {bot.realized_profit:.2f} USDC to total: {total_realized:.2f} USDC")
+                    
+                    # Ensure we're adding the correct profit value
                     total_realized += bot.realized_profit
                     total_unrealized += bot.calculate_open_pnl()
                     total_reinvested += bot.profit_reinvested
