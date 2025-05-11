@@ -2033,19 +2033,24 @@ class BinanceTradingBot:
         try:
             # Constants for BNB purchase
             BNB_PURCHASE_AMOUNT_USDC = 10.0  # Amount in USDC to spend on BNB
-            MIN_WALLET_SAVINGS = 5.0  # Minimum wallet savings required to purchase BNB
+            MIN_SHARED_USDC_FOR_BNB = 5.0  # Minimum shared USDC balance required to purchase BNB
 
-            # Check if we have enough wallet savings to purchase BNB
-            if self.wallet_savings < MIN_WALLET_SAVINGS:
+            # Check if we have enough shared USDC to purchase BNB
+            if self.shared_balance.available_balance < MIN_SHARED_USDC_FOR_BNB:
                 self.logger.warning(
-                    f"Not enough wallet savings ({self.wallet_savings:.2f} USDC) to purchase BNB. Minimum required: {MIN_WALLET_SAVINGS:.2f} USDC")
+                    f"Not enough shared USDC ({self.shared_balance.available_balance:.2f}) to purchase BNB. Minimum required: {MIN_SHARED_USDC_FOR_BNB:.2f} USDC")
                 return False
 
-            # Calculate amount to spend (limited by wallet savings)
+            # Calculate amount to spend (limited by available shared USDC)
             purchase_amount = min(
                 BNB_PURCHASE_AMOUNT_USDC,
-                self.wallet_savings -
-                1.0)  # Keep at least 1 USDC in savings
+                self.shared_balance.available_balance -
+                1.0)  # Keep at least 1 USDC in shared balance
+
+            if purchase_amount < 1.0: # Assuming 1 USDC is the absolute minimum practical amount for a BNB trade
+                self.logger.warning(
+                    f"Calculated BNB purchase amount ({purchase_amount:.2f} USDC) is too low due to insufficient shared balance. Aborting BNB purchase.")
+                return False
 
             # Get current BNB/USDC price
             try:
@@ -2074,14 +2079,15 @@ class BinanceTradingBot:
                     order['amount']) if 'amount' in order and order['amount'] else bnb_amount
                 actual_cost = executed_price * executed_amount
 
-                # Update wallet savings
-                self.wallet_savings -= actual_cost
+                # Update shared balance
+                with self.shared_balance.lock:
+                    self.shared_balance.available_balance -= actual_cost
 
                 # Log the successful purchase
                 self.logger.info(
                     f"Successfully purchased {executed_amount:.6f} BNB for {actual_cost:.2f} USDC")
                 self.logger.info(
-                    f"Wallet savings updated: {self.wallet_savings:.2f} USDC")
+                    f"Shared balance updated. Available: {self.shared_balance.available_balance:.2f} USDC")
 
                 # Send Telegram notification
                 if hasattr(self, 'telegram') and self.telegram is not None:
