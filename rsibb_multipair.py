@@ -19,7 +19,7 @@ RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.2
 RSI_BUY_THRESHOLD = 32 
-BASE_ORDER_SIZE = 20
+BASE_ORDER_SIZE = 100
 MAX_ACTIVE_ORDERS = 2
 MAX_SAFETY_ORDERS = 10
 SAFETY_ORDER_STEP = 1.2 # %
@@ -30,17 +30,11 @@ TAKER_FEE_RATE = 0.095  # 0.1% taker fee
 BNB_DISCOUNT_RATE = 0.75  # 25% discount using BNB
 SAFETY_ORDER_VOLUME_SCALE = 1.05
 WAIT_TIME_AFTER_CLOSE = 40  # seconds
-MAX_POSITION_SIZE = 220
-MAX_TOTAL_INVESTMENT = 220
+MAX_POSITION_SIZE = 2200
+MAX_TOTAL_INVESTMENT = 2200
 INITIAL_BALANCE_PER_BOT = MAX_POSITION_SIZE
 CHECK_INTERVAL = 60  # seconds/candle
 AUTO_PURCHASE_BNB = True  # Enable automatic BNB purchases when balance is low
-
-# Constants for EUR Savings
-PROFIT_PORTION_TO_EUR_SAVINGS = 3.0  # Amount of profit in USDC to allocate to EUR savings
-USDC_ACCUMULATION_THRESHOLD_FOR_EUR = 12.0  # Accumulate this much USDC before converting to EUR
-MIN_USDC_FOR_EUR_CONVERSION_TRADE = 10.0  # Minimum USDC amount for a EUR conversion trade
-EUR_SAVINGS_TRADING_PAIR = 'EUR/USDC'  # Trading pair for USDC to EUR conversion
 
 
 class CustomAdapter(logging.LoggerAdapter):
@@ -317,10 +311,7 @@ class BinanceTradingBot:
         self.unrealized_profit = 0
         self.total_fees_paid = 0
         self.pending_profit = 0  # Add this back for compatibility
-
-        # EUR Savings attributes
-        self.usdc_accumulated_for_eur = 0.0
-        self.eur_savings_total = 0.0
+        self.processed_closure_order_ids = set()  # Track processed closure orders
 
         # Fee-related properties
         self.using_bnb_for_fees = False
@@ -674,119 +665,12 @@ class BinanceTradingBot:
 
             # Execute the order
             order = self.exchange.create_order(**order_params)
+
+            # Extract order details
             order_id = order['id']
-            self.logger.info(f"Order {order_id} created for {self.symbol} with params: {order_params}")
-
-            # For BUY limit orders, check if filled within timeout
-            if side.lower() == 'buy' and order_params.get('type') == 'limit':
-                order_filled = False
-                order_details_fetched = False # To track if we got order details from fetch_order
-                start_time_check = time.time()
-                timeout_seconds = 120  # 2 minutes timeout
-                self.logger.info(f"BUY Limit order {order_id} for {self.symbol}. Waiting for fill (timeout: {timeout_seconds}s).")
-                
-                while time.time() - start_time_check < timeout_seconds:
-                    try:
-                        fetched_order = self.exchange.fetch_order(order_id, self.exchange_symbol)
-                        order_details_fetched = True
-                        if fetched_order['status'] == 'closed':  # 'closed' means filled for limit orders
-                            order_filled = True
-                            order = fetched_order  # Update order with filled details (price, amount, fees)
-                            self.logger.info(f"BUY Limit order {order_id} for {self.symbol} FILLED. Price: {order.get('average', order.get('price'))}, Amount: {order.get('filled')}")
-                            break
-                        elif fetched_order['status'] == 'canceled':
-                            self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} was CANCELED externally before filling.")
-                            self.telegram.send_notification(f"⚠️ {self.symbol} BUY Limit order {order_id[:8]} CANCELED externally.")
-                            return None  # Order canceled, do not proceed
-                        elif fetched_order['status'] == 'expired':
-                            self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} EXPIRED.")
-                            self.telegram.send_notification(f"⚠️ {self.symbol} BUY Limit order {order_id[:8]} EXPIRED.")
-                            return None # Order expired
-                        
-                        self.logger.debug(f"BUY Limit order {order_id} status: {fetched_order['status']}. Waiting... ({int(time.time() - start_time_check)}s / {timeout_seconds}s)")
-                        time.sleep(10)  # Check every 10 seconds
-                    except ccxt.OrderNotFound:
-                        self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} not found during status check. It might have filled and been removed or an issue occurred.")
-                        # Attempt to fetch trades for the symbol to see if it filled
-                        try:
-                            trades = self.exchange.fetch_my_trades(symbol=self.exchange_symbol, limit=5)
-                            for trade_item in trades: # renamed trade to trade_item to avoid conflict with outer scope if any
-                                if trade_item['order'] == order_id:
-                                    self.logger.info(f"BUY Limit order {order_id} found in recent trades. Assuming filled and attempting to re-fetch order details.")
-                                    try:
-                                        order = self.exchange.fetch_order(order_id, self.exchange_symbol) # Re-assign to 'order'
-                                        if order['status'] == 'closed':
-                                            order_filled = True
-                                            order_details_fetched = True
-                                            self.logger.info(f"Re-fetched BUY Limit order {order_id} for {self.symbol} - FILLED.")
-                                        break # Exit trades loop
-                                    except Exception as e_refetch:
-                                        self.logger.error(f"Could not re-fetch order {order_id} after OrderNotFound but found in trades: {e_refetch}")
-                            if order_filled: break # Exit while loop
-                        except Exception as e_trades:
-                            self.logger.error(f"Error fetching trades for {order_id}: {e_trades}")
-                        time.sleep(10) # Wait before retrying fetch_order in the main loop
-                    except Exception as e:
-                        self.logger.error(f"Error fetching order {order_id} status: {e}. Retrying in 10s.")
-                        time.sleep(10)
-                        continue  # Retry fetching status
-                
-                if not order_filled:
-                    self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} did not fill within {timeout_seconds}s.")
-                    try:
-                        cancel_attempt = self.exchange.cancel_order(order_id, self.exchange_symbol)
-                        self.logger.info(f"Attempted to cancel BUY Limit order {order_id}. Response: {cancel_attempt}")
-                        time.sleep(2) # Give time for cancellation to process
-                        final_check_order = self.exchange.fetch_order(order_id, self.exchange_symbol)
-                        order_details_fetched = True
-                        if final_check_order['status'] == 'canceled':
-                            self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} successfully CANCELED after timeout.")
-                            self.telegram.send_notification(f"⚠️ {self.symbol} BUY Limit order {order_id[:8]} timed out and was CANCELED.")
-                        elif final_check_order['status'] == 'closed':
-                             self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} was FILLED just before/during cancellation.")
-                             order = final_check_order # Update order with filled details
-                             order_filled = True # Treat as filled
-                        else:
-                            self.logger.error(f"BUY Limit order {order_id} for {self.symbol} timed out but FAILED to cancel or status unclear: {final_check_order['status']}. Manual check required.")
-                            self.telegram.send_notification(f"🚨 CRITICAL: {self.symbol} BUY Limit order {order_id[:8]} timed out, FAILED to cancel. Status: {final_check_order['status']}. Manual check!")
-                    except ccxt.OrderNotFound:
-                         self.logger.warning(f"BUY Limit order {order_id} for {self.symbol} not found during cancellation. Assumed already canceled/expired or filled and removed.")
-                         # If not found, it's likely not open. To be safe, don't assume filled unless confirmed.
-                    except Exception as e:
-                        self.logger.error(f"Error canceling timed out BUY limit order {order_id}: {e}. Order might still be active or filled.")
-                        self.telegram.send_notification(f"🚨 ERROR: {self.symbol} BUY Limit order {order_id[:8]} timed out. Error during cancellation: {e}. Manual check!")
-                    
-                    if not order_filled: # If still not marked as filled after cancellation logic
-                        return None  # Order not filled and (attempted) canceled, do not proceed
-
-            # If the order was not a BUY LIMIT, or it was filled, or it was a market order.
-            # For market orders or if fetch_order wasn't called successfully during limit order check, fetch details.
-            if not order_details_fetched or (order_params.get('type') == 'market' and not order.get('filled')):
-                try:
-                    time.sleep(1) # Give a moment for market order to fill / details to be available
-                    fetched_order = self.exchange.fetch_order(order_id, self.exchange_symbol)
-                    order = fetched_order # Update order with latest details
-                    self.logger.info(f"Fetched/updated details for order {order_id}: Status {order.get('status')}, Filled: {order.get('filled')}, Price: {order.get('average', order.get('price'))}")
-                except Exception as e:
-                    self.logger.error(f"Could not fetch/update details for order {order_id}: {e}")
-                    if side.lower() == 'buy':
-                        self.telegram.send_notification(f"🚨 WARNING: {self.symbol} BUY order {order_id[:8]} - could not confirm fill details. {e}")
-                        # Depending on strictness, might return None here
-
-            executed_price = float(order.get('average', order.get('price', 0)))
-            executed_amount = float(order.get('filled', order.get('amount', 0)))
-            
-            if side.lower() == 'buy' and executed_amount == 0:
-                current_status = order.get('status', 'unknown')
-                self.logger.error(f"BUY order {order_id} for {self.symbol} resulted in 0 filled amount. Final Status: {current_status}.")
-                if current_status not in ['canceled', 'expired']:
-                    self.telegram.send_notification(f"🚨 CRITICAL: {self.symbol} BUY order {order_id[:8]} reported 0 filled amount. Status: {current_status}. Manual check needed!")
-                return None
-
+            executed_price = float(order['price'])
+            executed_amount = float(order['amount'])
             actual_cost = executed_price * executed_amount
-            if side.lower() == 'buy' and actual_cost == 0 and executed_amount > 0:
-                 self.logger.warning(f"BUY order {order_id} for {self.symbol} has 0 cost (price: {executed_price}) but filled amount {executed_amount}. This might be a data issue or an exchange peculiarity.")
-
 
             # Calculate fee based on the actual cost
             actual_fee = self.calculate_fee(actual_cost)
@@ -1253,6 +1137,17 @@ class BinanceTradingBot:
                 amount=total_amount
             )
 
+            # Prevent double processing of the same closure order
+            if order['id'] in self.processed_closure_order_ids:
+                self.logger.warning(f"Closure order {order['id']} for position {position_id} already processed. Skipping profit update.")
+                # If already processed, we might not want to proceed further or even delete the position again.
+                # Depending on exact flow, might need to return a specific value or ensure no duplicate logging.
+                # For now, returning False to indicate the closure wasn't 'newly' processed.
+                # Also, ensure that `del self.positions[position_id]` is not called again if already deleted.
+                # The original check `if position_id not in self.positions:` should handle this for `self.positions`.
+                return False 
+            self.processed_closure_order_ids.add(order['id'])
+
             executed_price = float(
                 order['price']) if 'price' in order and order['price'] else current_price
             executed_amount = float(
@@ -1289,10 +1184,6 @@ class BinanceTradingBot:
 
             # Update balance with net proceeds
             self.balance += net_proceeds
-            
-            # Log the profit being added to realized profit for debugging
-            self.logger.info(f"Received profit: {profit:.2f} USDC (Total realized: {self.realized_profit + profit:.2f} USDC)")
-            
             self.realized_profit += profit
             self.total_fees_paid += closing_fee
 
@@ -1367,21 +1258,12 @@ class BinanceTradingBot:
                 self.performance_monitor.last_analysis_time = datetime.now()
                 
                 # Enviar informe de rendimiento por Telegram
-                # Changed from notify_custom_message to send_notification as the former doesn't exist
-                self.telegram.send_notification(
+                self.telegram.notify_custom_message(
                     f"📊 Informe de rendimiento para {self.symbol}:\n{performance_report}")
 
-            # Manage profit distribution (profit is already added to self.realized_profit)
+            # Manage profit distribution (just add to realized profit)
             if profit > 0:
-                # self.manage_profit_distribution(profit) # This was causing double profit reporting
-
-                # Allocate a portion of profit to EUR savings buffer
-                if profit >= PROFIT_PORTION_TO_EUR_SAVINGS:
-                    self.usdc_accumulated_for_eur += PROFIT_PORTION_TO_EUR_SAVINGS
-                    self.logger.info(f"Added {PROFIT_PORTION_TO_EUR_SAVINGS:.2f} USDC to EUR savings buffer. Current buffer: {self.usdc_accumulated_for_eur:.2f} USDC")
-                    self._convert_usdc_to_eur_savings() # Attempt conversion if threshold met
-                else:
-                    self.logger.info(f"Profit {profit:.2f} USDC is less than {PROFIT_PORTION_TO_EUR_SAVINGS:.2f} USDC. Not adding to EUR savings buffer.")
+                self.manage_profit_distribution(profit)
 
                 # Update win/loss counters
                 self.winning_trades += 1
@@ -1396,86 +1278,6 @@ class BinanceTradingBot:
             self.logger.error(
                 f"Error closing position {position_id}: {str(e)}")
             return False
-
-    def _convert_usdc_to_eur_savings(self):
-        """Converts accumulated USDC to EUR if thresholds are met."""
-        if self.usdc_accumulated_for_eur >= USDC_ACCUMULATION_THRESHOLD_FOR_EUR:
-            amount_to_convert = self.usdc_accumulated_for_eur # Use the full accumulated amount if it's over threshold
-            
-            if amount_to_convert < MIN_USDC_FOR_EUR_CONVERSION_TRADE:
-                self.logger.info(f"USDC for EUR conversion ({amount_to_convert:.2f}) is below minimum trade amount ({MIN_USDC_FOR_EUR_CONVERSION_TRADE:.2f} USDC). Holding.")
-                return
-
-            self.logger.info(f"Attempting to convert {amount_to_convert:.2f} USDC to EUR.")
-            actual_trading_pair = EUR_SAVINGS_TRADING_PAIR # Default pair
-            try:
-                markets = self.exchange.load_markets()
-                if actual_trading_pair not in markets:
-                    self.logger.error(f"Trading pair {actual_trading_pair} not found on exchange.")
-                    # Fallback logic or alternative pair can be added here if desired
-                    # For now, we'll just log and return if the primary pair isn't found.
-                    return
-                
-                market_info = markets[actual_trading_pair]
-
-                ticker = self.exchange.fetch_ticker(actual_trading_pair)
-                # We are buying EUR with USDC, so we need the ask price (price sellers are asking for EUR)
-                current_price_eur_usdc = ticker['ask'] 
-                if not current_price_eur_usdc or current_price_eur_usdc <= 0:
-                    self.logger.error(f"Invalid or zero ask price for {actual_trading_pair}: {current_price_eur_usdc}")
-                    return
-                
-                # Calculate how much EUR we can buy with the accumulated USDC
-                eur_to_buy = amount_to_convert / current_price_eur_usdc
-                # Apply exchange precision rules for the amount (base currency: EUR for EUR/USDC)
-                eur_to_buy_adjusted = self.exchange.amount_to_precision(actual_trading_pair, eur_to_buy)
-                
-                # Ensure the cost of the adjusted amount is still above the minimums
-                cost_of_adjusted_eur = float(eur_to_buy_adjusted) * current_price_eur_usdc
-                min_cost_from_market = market_info.get('limits', {}).get('cost', {}).get('min', 0)
-                # If min_cost_from_market is 0 or not defined, use our defined MIN_USDC_FOR_EUR_CONVERSION_TRADE
-                effective_min_exchange_cost = min_cost_from_market if min_cost_from_market and min_cost_from_market > 0 else MIN_USDC_FOR_EUR_CONVERSION_TRADE
-
-                self.logger.info(f"Calculated EUR to buy: {eur_to_buy:.8f}, adjusted: {eur_to_buy_adjusted} for {actual_trading_pair} at price {current_price_eur_usdc:.5f}. Estimated cost: {cost_of_adjusted_eur:.2f} USDC. Min exchange cost: {effective_min_exchange_cost:.2f}")
-
-                if cost_of_adjusted_eur < effective_min_exchange_cost:
-                     self.logger.warning(f"Adjusted EUR amount {eur_to_buy_adjusted} (costing {cost_of_adjusted_eur:.2f} USDC) is too small to meet minimum exchange trade value ({effective_min_exchange_cost:.2f} USDC). Skipping conversion.")
-                     return
-                if cost_of_adjusted_eur < MIN_USDC_FOR_EUR_CONVERSION_TRADE: # Double check against our own defined minimum
-                    self.logger.warning(f"Adjusted EUR amount {eur_to_buy_adjusted} (costing {cost_of_adjusted_eur:.2f} USDC) is too small to meet defined minimum trade value ({MIN_USDC_FOR_EUR_CONVERSION_TRADE:.2f} USDC). Skipping conversion.")
-                    return
-
-                order = self.exchange.create_market_buy_order(actual_trading_pair, float(eur_to_buy_adjusted))
-
-                filled_eur = float(order.get('filled', 0.0))
-                actual_cost_usdc = float(order.get('cost', 0.0)) # Actual cost from the exchange
-
-                if filled_eur > 0 and actual_cost_usdc > 0:
-                    self.eur_savings_total += filled_eur
-                    self.usdc_accumulated_for_eur -= actual_cost_usdc 
-                    self.logger.info(f"Successfully converted {actual_cost_usdc:.2f} USDC to {filled_eur:.4f} EUR. Total EUR savings: {self.eur_savings_total:.4f} EUR. Remaining USDC buffer: {self.usdc_accumulated_for_eur:.2f} USDC")
-                    if hasattr(self, 'telegram') and self.telegram is not None:
-                        self.telegram.send_notification(f"💰 Converted {actual_cost_usdc:.2f} USDC to {filled_eur:.4f} EUR for savings. Total EUR savings: {self.eur_savings_total:.4f} EUR.")
-                elif order.get('status') in ['open', 'pending', 'new'] and (filled_eur > 0 or actual_cost_usdc > 0):
-                    self.logger.warning(f"EUR conversion order for {actual_trading_pair} placed but not immediately fully filled: {order}. Cost: {actual_cost_usdc}, Filled: {filled_eur}. Adjusting balances for partial fill.")
-                    if filled_eur > 0:
-                        self.eur_savings_total += filled_eur
-                    if actual_cost_usdc > 0:
-                         self.usdc_accumulated_for_eur -= actual_cost_usdc
-                    self.logger.info(f"After partial fill: Total EUR savings: {self.eur_savings_total:.4f} EUR. Remaining USDC buffer: {self.usdc_accumulated_for_eur:.2f} USDC")
-                else:
-                    self.logger.error(f"EUR conversion order for {actual_trading_pair} did not fill as expected or failed: {order}")
-
-            except ccxt.InsufficientFunds as e:
-                self.logger.error(f"Insufficient USDC funds for EUR conversion ({actual_trading_pair}): {e}. Accumulated USDC: {self.usdc_accumulated_for_eur:.2f}, Amount to convert: {amount_to_convert:.2f}")
-            except ccxt.NetworkError as e:
-                self.logger.error(f"Network error during EUR conversion ({actual_trading_pair}): {e}")
-            except ccxt.ExchangeError as e:
-                self.logger.error(f"Exchange error during EUR conversion ({actual_trading_pair}): {e}")
-            except Exception as e:
-                self.logger.error(f"Unexpected error during EUR conversion ({actual_trading_pair}): {str(e)}", exc_info=True)
-        elif self.usdc_accumulated_for_eur > 0: # Log only if there's something in buffer but not enough to convert
-             self.logger.info(f"USDC for EUR buffer ({self.usdc_accumulated_for_eur:.2f}) is below threshold ({USDC_ACCUMULATION_THRESHOLD_FOR_EUR:.2f} USDC). Holding.")
 
     def calculate_current_balance(self):
         """Calculate current balance including profits and savings"""
@@ -1526,8 +1328,6 @@ class BinanceTradingBot:
         Wallet Savings: {self.wallet_savings:.2f} USDC
         Profit Reinvested: {self.profit_reinvested:.2f} USDC
         Pending Profit: {self.pending_profit:.2f} USDC
-        USDC for EUR Savings: {self.usdc_accumulated_for_eur:.2f} USDC
-        EUR Savings: {self.eur_savings_total:.4f} EUR
         Active Positions: {len(self.positions)}
         Current Price: {self.current_price:.2f} USDC
         """
@@ -1845,8 +1645,8 @@ class BinanceTradingBot:
                         bb_color = Fore.GREEN if bb_below else Fore.RED if price_bb_ratio > 1.05 else Fore.YELLOW
 
                         print(
-                            f"  Entry conditions: RSI [{rsi_color}{'SI' if rsi_below else 'NO'}{Style.RESET_ALL}] " +
-                            f"BB [{bb_color}{'SI' if bb_below else 'NO'}{Style.RESET_ALL}]")
+                            f"  Entry conditions: RSI [{rsi_color}{'✓' if rsi_below else '✗'}{Style.RESET_ALL}] " +
+                            f"BB [{bb_color}{'✓' if bb_below else '✗'}{Style.RESET_ALL}]")
                     else:
                         print(
                             f"\n{Fore.YELLOW}Waiting for valid indicators...{Style.RESET_ALL}")
@@ -2033,24 +1833,19 @@ class BinanceTradingBot:
         try:
             # Constants for BNB purchase
             BNB_PURCHASE_AMOUNT_USDC = 10.0  # Amount in USDC to spend on BNB
-            MIN_SHARED_USDC_FOR_BNB = 5.0  # Minimum shared USDC balance required to purchase BNB
+            MIN_WALLET_SAVINGS = 5.0  # Minimum wallet savings required to purchase BNB
 
-            # Check if we have enough shared USDC to purchase BNB
-            if self.shared_balance.available_balance < MIN_SHARED_USDC_FOR_BNB:
+            # Check if we have enough wallet savings to purchase BNB
+            if self.wallet_savings < MIN_WALLET_SAVINGS:
                 self.logger.warning(
-                    f"Not enough shared USDC ({self.shared_balance.available_balance:.2f}) to purchase BNB. Minimum required: {MIN_SHARED_USDC_FOR_BNB:.2f} USDC")
+                    f"Not enough wallet savings ({self.wallet_savings:.2f} USDC) to purchase BNB. Minimum required: {MIN_WALLET_SAVINGS:.2f} USDC")
                 return False
 
-            # Calculate amount to spend (limited by available shared USDC)
+            # Calculate amount to spend (limited by wallet savings)
             purchase_amount = min(
                 BNB_PURCHASE_AMOUNT_USDC,
-                self.shared_balance.available_balance -
-                1.0)  # Keep at least 1 USDC in shared balance
-
-            if purchase_amount < 1.0: # Assuming 1 USDC is the absolute minimum practical amount for a BNB trade
-                self.logger.warning(
-                    f"Calculated BNB purchase amount ({purchase_amount:.2f} USDC) is too low due to insufficient shared balance. Aborting BNB purchase.")
-                return False
+                self.wallet_savings -
+                1.0)  # Keep at least 1 USDC in savings
 
             # Get current BNB/USDC price
             try:
@@ -2079,15 +1874,14 @@ class BinanceTradingBot:
                     order['amount']) if 'amount' in order and order['amount'] else bnb_amount
                 actual_cost = executed_price * executed_amount
 
-                # Update shared balance
-                with self.shared_balance.lock:
-                    self.shared_balance.available_balance -= actual_cost
+                # Update wallet savings
+                self.wallet_savings -= actual_cost
 
                 # Log the successful purchase
                 self.logger.info(
                     f"Successfully purchased {executed_amount:.6f} BNB for {actual_cost:.2f} USDC")
                 self.logger.info(
-                    f"Shared balance updated. Available: {self.shared_balance.available_balance:.2f} USDC")
+                    f"Wallet savings updated: {self.wallet_savings:.2f} USDC")
 
                 # Send Telegram notification
                 if hasattr(self, 'telegram') and self.telegram is not None:
@@ -2259,8 +2053,6 @@ class BinanceTradingBot:
                 Total Reinvested: {self.profit_reinvested:.2f} USDC
                 Wallet Savings: {self.wallet_savings:.2f} USDC
                 Pending Profit: {self.pending_profit:.2f} USDC
-                USDC for EUR Savings: {self.usdc_accumulated_for_eur:.2f} USDC
-                EUR Savings: {self.eur_savings_total:.4f} EUR
                 Current Base Order Size: {(BASE_ORDER_SIZE + self.base_order_increment):.2f} USDC
 
                 Trading Statistics:
@@ -2583,8 +2375,8 @@ def main():
     # Create a single shared exchange instance
     try:
         exchange = ccxt.binance({
-            'apiKey': config.TAPI_KEY,
-            'secret': config.TAPI_SECRET,
+            'apiKey': config.TBAPI_KEY,
+            'secret': config.TBAPI_SECRET,
         })
         exchange.set_sandbox_mode(True) # Set sandbox mode if needed
         logger.info("Shared Binance exchange instance created.")
@@ -2673,10 +2465,6 @@ def main():
                         'win_rate': win_rate
                     }
 
-                    # Log individual bot's realized profit for debugging
-                    logger.info(f"Adding {symbol} realized profit: {bot.realized_profit:.2f} USDC to total: {total_realized:.2f} USDC")
-                    
-                    # Ensure we're adding the correct profit value
                     total_realized += bot.realized_profit
                     total_unrealized += bot.calculate_open_pnl()
                     total_reinvested += bot.profit_reinvested
