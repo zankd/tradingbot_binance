@@ -36,6 +36,12 @@ INITIAL_BALANCE_PER_BOT = MAX_POSITION_SIZE
 CHECK_INTERVAL = 60  # seconds/candle
 AUTO_PURCHASE_BNB = True  # Enable automatic BNB purchases when balance is low
 
+# Constants for EUR Savings
+PROFIT_PORTION_TO_EUR_SAVINGS = 3.0  # Amount of profit in USDC to allocate to EUR savings
+USDC_ACCUMULATION_THRESHOLD_FOR_EUR = 12.0  # Accumulate this much USDC before converting to EUR
+MIN_USDC_FOR_EUR_CONVERSION_TRADE = 10.0  # Minimum USDC amount for a EUR conversion trade
+EUR_SAVINGS_TRADING_PAIR = 'EUR/USDC'  # Trading pair for USDC to EUR conversion
+
 
 class CustomAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
@@ -311,6 +317,10 @@ class BinanceTradingBot:
         self.unrealized_profit = 0
         self.total_fees_paid = 0
         self.pending_profit = 0  # Add this back for compatibility
+
+        # EUR Savings attributes
+        self.usdc_accumulated_for_eur = 0.0
+        self.eur_savings_total = 0.0
 
         # Fee-related properties
         self.using_bnb_for_fees = False
@@ -1365,6 +1375,14 @@ class BinanceTradingBot:
             if profit > 0:
                 # self.manage_profit_distribution(profit) # This was causing double profit reporting
 
+                # Allocate a portion of profit to EUR savings buffer
+                if profit >= PROFIT_PORTION_TO_EUR_SAVINGS:
+                    self.usdc_accumulated_for_eur += PROFIT_PORTION_TO_EUR_SAVINGS
+                    self.logger.info(f"Added {PROFIT_PORTION_TO_EUR_SAVINGS:.2f} USDC to EUR savings buffer. Current buffer: {self.usdc_accumulated_for_eur:.2f} USDC")
+                    self._convert_usdc_to_eur_savings() # Attempt conversion if threshold met
+                else:
+                    self.logger.info(f"Profit {profit:.2f} USDC is less than {PROFIT_PORTION_TO_EUR_SAVINGS:.2f} USDC. Not adding to EUR savings buffer.")
+
                 # Update win/loss counters
                 self.winning_trades += 1
             else:
@@ -1378,6 +1396,86 @@ class BinanceTradingBot:
             self.logger.error(
                 f"Error closing position {position_id}: {str(e)}")
             return False
+
+    def _convert_usdc_to_eur_savings(self):
+        """Converts accumulated USDC to EUR if thresholds are met."""
+        if self.usdc_accumulated_for_eur >= USDC_ACCUMULATION_THRESHOLD_FOR_EUR:
+            amount_to_convert = self.usdc_accumulated_for_eur # Use the full accumulated amount if it's over threshold
+            
+            if amount_to_convert < MIN_USDC_FOR_EUR_CONVERSION_TRADE:
+                self.logger.info(f"USDC for EUR conversion ({amount_to_convert:.2f}) is below minimum trade amount ({MIN_USDC_FOR_EUR_CONVERSION_TRADE:.2f} USDC). Holding.")
+                return
+
+            self.logger.info(f"Attempting to convert {amount_to_convert:.2f} USDC to EUR.")
+            actual_trading_pair = EUR_SAVINGS_TRADING_PAIR # Default pair
+            try:
+                markets = self.exchange.load_markets()
+                if actual_trading_pair not in markets:
+                    self.logger.error(f"Trading pair {actual_trading_pair} not found on exchange.")
+                    # Fallback logic or alternative pair can be added here if desired
+                    # For now, we'll just log and return if the primary pair isn't found.
+                    return
+                
+                market_info = markets[actual_trading_pair]
+
+                ticker = self.exchange.fetch_ticker(actual_trading_pair)
+                # We are buying EUR with USDC, so we need the ask price (price sellers are asking for EUR)
+                current_price_eur_usdc = ticker['ask'] 
+                if not current_price_eur_usdc or current_price_eur_usdc <= 0:
+                    self.logger.error(f"Invalid or zero ask price for {actual_trading_pair}: {current_price_eur_usdc}")
+                    return
+                
+                # Calculate how much EUR we can buy with the accumulated USDC
+                eur_to_buy = amount_to_convert / current_price_eur_usdc
+                # Apply exchange precision rules for the amount (base currency: EUR for EUR/USDC)
+                eur_to_buy_adjusted = self.exchange.amount_to_precision(actual_trading_pair, eur_to_buy)
+                
+                # Ensure the cost of the adjusted amount is still above the minimums
+                cost_of_adjusted_eur = float(eur_to_buy_adjusted) * current_price_eur_usdc
+                min_cost_from_market = market_info.get('limits', {}).get('cost', {}).get('min', 0)
+                # If min_cost_from_market is 0 or not defined, use our defined MIN_USDC_FOR_EUR_CONVERSION_TRADE
+                effective_min_exchange_cost = min_cost_from_market if min_cost_from_market and min_cost_from_market > 0 else MIN_USDC_FOR_EUR_CONVERSION_TRADE
+
+                self.logger.info(f"Calculated EUR to buy: {eur_to_buy:.8f}, adjusted: {eur_to_buy_adjusted} for {actual_trading_pair} at price {current_price_eur_usdc:.5f}. Estimated cost: {cost_of_adjusted_eur:.2f} USDC. Min exchange cost: {effective_min_exchange_cost:.2f}")
+
+                if cost_of_adjusted_eur < effective_min_exchange_cost:
+                     self.logger.warning(f"Adjusted EUR amount {eur_to_buy_adjusted} (costing {cost_of_adjusted_eur:.2f} USDC) is too small to meet minimum exchange trade value ({effective_min_exchange_cost:.2f} USDC). Skipping conversion.")
+                     return
+                if cost_of_adjusted_eur < MIN_USDC_FOR_EUR_CONVERSION_TRADE: # Double check against our own defined minimum
+                    self.logger.warning(f"Adjusted EUR amount {eur_to_buy_adjusted} (costing {cost_of_adjusted_eur:.2f} USDC) is too small to meet defined minimum trade value ({MIN_USDC_FOR_EUR_CONVERSION_TRADE:.2f} USDC). Skipping conversion.")
+                    return
+
+                order = self.exchange.create_market_buy_order(actual_trading_pair, float(eur_to_buy_adjusted))
+
+                filled_eur = float(order.get('filled', 0.0))
+                actual_cost_usdc = float(order.get('cost', 0.0)) # Actual cost from the exchange
+
+                if filled_eur > 0 and actual_cost_usdc > 0:
+                    self.eur_savings_total += filled_eur
+                    self.usdc_accumulated_for_eur -= actual_cost_usdc 
+                    self.logger.info(f"Successfully converted {actual_cost_usdc:.2f} USDC to {filled_eur:.4f} EUR. Total EUR savings: {self.eur_savings_total:.4f} EUR. Remaining USDC buffer: {self.usdc_accumulated_for_eur:.2f} USDC")
+                    if hasattr(self, 'telegram') and self.telegram is not None:
+                        self.telegram.send_notification(f"💰 Converted {actual_cost_usdc:.2f} USDC to {filled_eur:.4f} EUR for savings. Total EUR savings: {self.eur_savings_total:.4f} EUR.")
+                elif order.get('status') in ['open', 'pending', 'new'] and (filled_eur > 0 or actual_cost_usdc > 0):
+                    self.logger.warning(f"EUR conversion order for {actual_trading_pair} placed but not immediately fully filled: {order}. Cost: {actual_cost_usdc}, Filled: {filled_eur}. Adjusting balances for partial fill.")
+                    if filled_eur > 0:
+                        self.eur_savings_total += filled_eur
+                    if actual_cost_usdc > 0:
+                         self.usdc_accumulated_for_eur -= actual_cost_usdc
+                    self.logger.info(f"After partial fill: Total EUR savings: {self.eur_savings_total:.4f} EUR. Remaining USDC buffer: {self.usdc_accumulated_for_eur:.2f} USDC")
+                else:
+                    self.logger.error(f"EUR conversion order for {actual_trading_pair} did not fill as expected or failed: {order}")
+
+            except ccxt.InsufficientFunds as e:
+                self.logger.error(f"Insufficient USDC funds for EUR conversion ({actual_trading_pair}): {e}. Accumulated USDC: {self.usdc_accumulated_for_eur:.2f}, Amount to convert: {amount_to_convert:.2f}")
+            except ccxt.NetworkError as e:
+                self.logger.error(f"Network error during EUR conversion ({actual_trading_pair}): {e}")
+            except ccxt.ExchangeError as e:
+                self.logger.error(f"Exchange error during EUR conversion ({actual_trading_pair}): {e}")
+            except Exception as e:
+                self.logger.error(f"Unexpected error during EUR conversion ({actual_trading_pair}): {str(e)}", exc_info=True)
+        elif self.usdc_accumulated_for_eur > 0: # Log only if there's something in buffer but not enough to convert
+             self.logger.info(f"USDC for EUR buffer ({self.usdc_accumulated_for_eur:.2f}) is below threshold ({USDC_ACCUMULATION_THRESHOLD_FOR_EUR:.2f} USDC). Holding.")
 
     def calculate_current_balance(self):
         """Calculate current balance including profits and savings"""
@@ -1428,6 +1526,8 @@ class BinanceTradingBot:
         Wallet Savings: {self.wallet_savings:.2f} USDC
         Profit Reinvested: {self.profit_reinvested:.2f} USDC
         Pending Profit: {self.pending_profit:.2f} USDC
+        USDC for EUR Savings: {self.usdc_accumulated_for_eur:.2f} USDC
+        EUR Savings: {self.eur_savings_total:.4f} EUR
         Active Positions: {len(self.positions)}
         Current Price: {self.current_price:.2f} USDC
         """
@@ -2153,6 +2253,8 @@ class BinanceTradingBot:
                 Total Reinvested: {self.profit_reinvested:.2f} USDC
                 Wallet Savings: {self.wallet_savings:.2f} USDC
                 Pending Profit: {self.pending_profit:.2f} USDC
+                USDC for EUR Savings: {self.usdc_accumulated_for_eur:.2f} USDC
+                EUR Savings: {self.eur_savings_total:.4f} EUR
                 Current Base Order Size: {(BASE_ORDER_SIZE + self.base_order_increment):.2f} USDC
 
                 Trading Statistics:
