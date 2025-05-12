@@ -358,6 +358,10 @@ class BinanceTradingBot:
 
         if self.recovery.restore_from_backup(self):
             self.logger.info("Bot state restored from backup")
+            # Ensure processed_closure_order_ids is initialized as a set if not present
+            if not hasattr(self, 'processed_closure_order_ids') or self.processed_closure_order_ids is None:
+                self.processed_closure_order_ids = set()
+                self.logger.info("Initialized processed_closure_order_ids set")
 
     def log_message(self, message):
         self.logger.info(message)
@@ -1140,13 +1144,11 @@ class BinanceTradingBot:
             # Prevent double processing of the same closure order
             if order['id'] in self.processed_closure_order_ids:
                 self.logger.warning(f"Closure order {order['id']} for position {position_id} already processed. Skipping profit update.")
-                # If already processed, we might not want to proceed further or even delete the position again.
-                # Depending on exact flow, might need to return a specific value or ensure no duplicate logging.
-                # For now, returning False to indicate the closure wasn't 'newly' processed.
-                # Also, ensure that `del self.positions[position_id]` is not called again if already deleted.
-                # The original check `if position_id not in self.positions:` should handle this for `self.positions`.
+                # If already processed, we don't want to proceed further to avoid duplicate profit counting,
+                # notifications, and position deletion.
                 return False 
             self.processed_closure_order_ids.add(order['id'])
+            self.logger.info(f"Added order ID {order['id']} to processed closure orders set. Current set size: {len(self.processed_closure_order_ids)}")
 
             executed_price = float(
                 order['price']) if 'price' in order and order['price'] else current_price
