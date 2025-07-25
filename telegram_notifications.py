@@ -101,7 +101,7 @@ class TelegramNotifier:
 """
         self.send_notification(message)
 
-    def notify_position_closed(self, symbol, position_id, profit, profit_percentage, total_fees=0, time_held=None, exchange="", fee_percentage=0):
+    def notify_position_closed(self, symbol, position_id, profit, profit_percentage, closing_price, total_fees=0, time_held=None, exchange="", fee_percentage=0):
         """Notification for position closure with dynamic exchange name"""
         if profit > 0:
             emoji = "🎯"
@@ -120,6 +120,7 @@ class TelegramNotifier:
             f"🚀 {exchange} Position Closed on {symbol}\n"
             f"🔑 ID: {position_id[:8]}\n"
             f"💰 Profit: {profit:.2f} USDC ({profit_percentage:+.2f}%)\n"
+            f"🔒 Close Price: {closing_price:.4f} USDC\n"
             f"{fee_text}\n"
             f"⏳ Time Held: {time_held if time_held else 'N/A'}\n"
             f"⏰ Time: {self.format_timestamp()}\n\n"
@@ -308,7 +309,7 @@ class TelegramNotifier:
         fee_text = f"💸 Total Fees Paid: {total_fees:.2f} USDC"
         
         message = (
-            f"🚨📢 <b>ATTENTION MEATBAG! {exchange} MASTER REPORT!</b> 📢🚨\n\n"
+            f"🚨📢 <b>ATTENTION, {exchange} MASTER REPORT!</b> 📢🚨\n\n"
             f"📊 Overall Performance:\n"
             f"💰 Total Realized Profit: {total_realized:+.2f} USDC\n"
             f"📈 Total Unrealized Profit: {total_unrealized:+.2f} USDC\n"
@@ -340,26 +341,21 @@ receiving trading fee discounts.
 """
         self.send_notification(message)
         
-    def notify_bnb_purchase(self, amount_usdc, amount_bnb, price, exchange=""):
-        message = f"""
-💰 <b>{exchange} BNB PURCHASE COMPLETED</b> 💰
-
-🔄 Purchased {amount_bnb:.6f} BNB for {amount_usdc:.2f} USDC
-💲 Price: {price:.2f} USDC per BNB
-⏱️ Time: {self.format_timestamp()}
-
-<i>Fuel tank refilled! Now I can keep those sweet fee discounts coming! 🤖⛽</i>
-"""
+    def notify_bnb_purchase_success(self, amount, cost):
+        """Notify that BNB was successfully purchased."""
+        message = (
+            f"<b>BNB Purchase Successful!</b> 🤖✅\n\n"
+            f"Successfully purchased <b>{amount:.6f} BNB</b> for <b>{cost:.2f} USDC</b>.\n"
+            f"<i>Fuel tank refilled! Now I can keep those sweet fee discounts coming! 🤖⛽</i>"
+        )
         self.send_notification(message)
         
-    def notify_bnb_purchase_failed(self, amount_usdc, error_message, exchange=""):
-        message = f"""
-❌ <b>{exchange} BNB PURCHASE FAILED</b> ❌
-
-💸 Attempted to purchase BNB for {amount_usdc:.2f} USDC
-⚠️ Error: {error_message}
-⏱️ Time: {self.format_timestamp()}
-
-<i>Well, that didn't work. Looks like I'll have to pay full price for fees like some kind of... human. 🤖💔</i>
-"""
+    def notify_bnb_purchase_failure(self, error):
+        """Notify that BNB purchase failed."""
+        message = (
+            f"<b>BNB Purchase Failed!</b> 🤖❌\n\n"
+            f"Attempted to purchase BNB, but the transaction failed.\n"
+            f"<b>Error:</b> {error}\n"
+            f"<i>Well, that didn't work. Looks like I'll have to pay full price for fees like some kind of... human. 🤖💔</i>"
+        )
         self.send_notification(message)
